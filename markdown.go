@@ -796,3 +796,26 @@ func isCJK(r rune) bool {
 		(r >= 0xAC00 && r <= 0xD7AF) ||
 		(r >= 0xF900 && r <= 0xFAFF)
 }
+
+type tocEntry struct {
+	Level int
+	Title string
+	Block int
+}
+
+// TOC collects the document headings in source order, using the rendered
+// plain text as the entry title so inline markers do not show up.
+func (d *Document) TOC() []tocEntry {
+	var out []tocEntry
+	for i, b := range d.Blocks {
+		if b.Kind != kindHeading || b.Display == nil {
+			continue
+		}
+		title := strings.TrimSpace(b.Display.Plain)
+		if title == "" {
+			continue
+		}
+		out = append(out, tocEntry{Level: b.Level, Title: title, Block: i})
+	}
+	return out
+}

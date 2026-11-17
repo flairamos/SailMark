@@ -146,6 +146,9 @@ func (a *App) layoutMenu(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return a.menuButton(gtx, "查找", &a.findBtn, enabled, a.toggleFind)
 			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return a.menuButton(gtx, "目录", &a.tocBtn, enabled, a.toggleTOC)
+			}),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				title := ""
 				if a.docOpen {
@@ -299,6 +302,121 @@ func (a *App) layoutStatusBar(gtx layout.Context) layout.Dimensions {
 	})
 }
 
+func (a *App) layoutTOC(gtx layout.Context) layout.Dimensions {
+	w := gtx.Dp(unit.Dp(268))
+	if w > gtx.Constraints.Max.X {
+		w = gtx.Constraints.Max.X
+	}
+	gtx.Constraints.Min = image.Pt(w, gtx.Constraints.Max.Y)
+	gtx.Constraints.Max = image.Pt(w, gtx.Constraints.Max.Y)
+
+	// Derive the active entry from the heading positions the last viewport
+	// pass recorded. Content-space tops are scroll invariant, so combining
+	// them with the current scroll keeps the highlight in sync even when the
+	// scroll position just settled and no further frame was scheduled.
+	a.tocCurrent = -1
+	if len(a.tocTops) == len(a.tocEntries) {
+		limit := a.scroll + gtx.Constraints.Max.Y/4
+		for ei, top := range a.tocTops {
+			if top >= 0 && top <= limit {
+				a.tocCurrent = ei
+			}
+		}
+	}
+
+	fillRect(gtx.Ops, image.Rect(0, 0, w, gtx.Constraints.Max.Y), colSurface)
+	fillRect(gtx.Ops, image.Rect(w-1, 0, w, gtx.Constraints.Max.Y), colBorderSoft)
+
+	headerH := gtx.Dp(unit.Dp(46))
+	fillRect(gtx.Ops, image.Rect(0, 0, w, headerH), colSurfaceAlt)
+	fillRect(gtx.Ops, image.Rect(0, headerH-1, w, headerH), colBorderSoft)
+
+	titleStyle := textStyle{size: unit.Sp(14), bold: true, color: colText}
+	titleDims, titleCall := a.measureText(gtx, "目录", titleStyle)
+	off := op.Offset(image.Pt(gtx.Dp(unit.Dp(16)), (headerH-titleDims.Size.Y)/2)).Push(gtx.Ops)
+	titleCall.Add(gtx.Ops)
+	off.Pop()
+	if n := len(a.tocEntries); n > 0 {
+		countStyle := textStyle{size: unit.Sp(11.5), color: colTextFaint}
+		cx := gtx.Dp(unit.Dp(16)) + titleDims.Size.X + gtx.Dp(unit.Dp(10))
+		a.drawLabel(gtx, fmt.Sprintf("%d 个标题", n), countStyle, cx, (headerH-gtx.Sp(unit.Sp(16)))/2)
+	}
+
+	btnW := gtx.Dp(unit.Dp(34))
+	btnH := gtx.Dp(unit.Dp(30))
+	bo := op.Offset(image.Pt(w-btnW-gtx.Dp(unit.Dp(8)), (headerH-btnH)/2)).Push(gtx.Ops)
+	bc := gtx
+	bc.Constraints.Min = image.Pt(btnW, btnH)
+	bc.Constraints.Max = image.Pt(btnW, btnH)
+	_ = a.textButton(bc, "✕", &a.tocClose, true, false, func() {
+		a.tocOpen = false
+		a.invalidate()
+	})
+	bo.Pop()
+
+	lc := gtx
+	lc.Constraints.Min = image.Pt(w, 0)
+	lc.Constraints.Max = image.Pt(w, gtx.Constraints.Max.Y-headerH)
+	lo := op.Offset(image.Pt(0, headerH)).Push(gtx.Ops)
+	if len(a.tocEntries) == 0 {
+		a.drawLabel(lc, "文档中没有标题", textStyle{size: unit.Sp(12.5), color: colTextFaint}, gtx.Dp(unit.Dp(16)), gtx.Dp(unit.Dp(14)))
+	} else {
+		a.tocList.Axis = layout.Vertical
+		a.tocList.Layout(lc, len(a.tocEntries), a.layoutTOCEntry)
+	}
+	lo.Pop()
+	return layout.Dimensions{Size: image.Pt(w, gtx.Constraints.Max.Y)}
+}
+
+func (a *App) layoutTOCEntry(gtx layout.Context, i int) layout.Dimensions {
+	ent := a.tocEntries[i]
+	btn := &a.tocClicks[i]
+	if btn.Clicked(gtx) {
+		a.tocJump = i
+		gtx.Execute(op.InvalidateCmd{})
+	}
+	return btn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		w := gtx.Constraints.Max.X
+		h := gtx.Dp(unit.Dp(30))
+		active := i == a.tocCurrent
+		st := textStyle{size: unit.Sp(12.5), color: colTextMuted}
+		if ent.Level <= 2 {
+			st.bold = true
+		}
+		if active {
+			st.color = colAccent
+		} else if btn.Hovered() {
+			st.color = colText
+		}
+		if active || btn.Hovered() {
+			bg := colMenuHover
+			if active {
+				bg = colAccentSoft
+			}
+			fillRect(gtx.Ops, image.Rect(0, 0, w, h), bg)
+		}
+		if active {
+			fillRect(gtx.Ops, image.Rect(0, 0, gtx.Dp(unit.Dp(3)), h), colAccent)
+		}
+		indent := gtx.Dp(unit.Dp(12)) + gtx.Dp(unit.Dp(float32(ent.Level-1)*13))
+		maxW := w - indent - gtx.Dp(unit.Dp(12))
+		if maxW < 40 {
+			maxW = 40
+		}
+		m := op.Record(gtx.Ops)
+		dims := a.labelTruncated(gtx, ent.Title, st, maxW, text.Start)
+		call := m.Stop()
+		y := (h - dims.Size.Y) / 2
+		if y < 0 {
+			y = 0
+		}
+		off := op.Offset(image.Pt(indent, y)).Push(gtx.Ops)
+		call.Add(gtx.Ops)
+		off.Pop()
+		return layout.Dimensions{Size: image.Pt(w, h)}
+	})
+}
+
 func (a *App) layoutViewport(gtx layout.Context) layout.Dimensions {
 	size := gtx.Constraints.Max
 	if size.X <= 0 || size.Y <= 0 {
@@ -359,12 +477,42 @@ func (a *App) layoutViewport(gtx layout.Context) layout.Dimensions {
 			y += dims.Size.Y + gap
 		}
 		a.contentH = y + bottomPad
+
+		// Record heading tops in content space. The outline panel reads these
+		// when it draws, so its highlight follows scrolling without waiting
+		// for another viewport pass.
+		if len(a.tocEntries) > 0 {
+			if cap(a.tocTops) < len(a.tocEntries) {
+				a.tocTops = make([]int, len(a.tocEntries))
+			}
+			a.tocTops = a.tocTops[:len(a.tocEntries)]
+			for ei, ent := range a.tocEntries {
+				a.tocTops[ei] = -1
+				if ent.Block >= 0 && ent.Block < len(a.blockRects) {
+					a.tocTops[ei] = a.blockRects[ent.Block].Min.Y + a.scroll
+				}
+			}
+		}
+
 		newMax := 0
 		if a.contentH > size.Y {
 			newMax = a.contentH - size.Y
 		}
 		if a.scroll > newMax {
 			a.scroll = newMax
+			gtx.Execute(op.InvalidateCmd{})
+		}
+
+		// A click on an outline entry lands the heading near the top. While a
+		// block is being edited, the click commits the edit right after this
+		// frame and may rebuild the blocks, so keep the jump pending until the
+		// document is consistent again.
+		if a.tocJump >= 0 && a.editIdx < 0 && a.tocJump < len(a.tocEntries) {
+			blk := a.tocEntries[a.tocJump].Block
+			a.tocJump = -1
+			if blk >= 0 && blk < len(a.blockRects) {
+				a.scroll = clamp(a.blockRects[blk].Min.Y+a.scroll-gtx.Dp(unit.Dp(16)), 0, newMax)
+			}
 			gtx.Execute(op.InvalidateCmd{})
 		}
 
@@ -441,7 +589,7 @@ func (a *App) layoutWelcome(gtx layout.Context, size image.Point) {
 	a.drawLabel(gtx, "SailMark", textStyle{size: unit.Sp(30), bold: true, color: colText}, x+pad, y+pad+gtx.Dp(unit.Dp(62)))
 	a.drawLabel(gtx, "轻量、专注的 Markdown 编辑器", textStyle{size: unit.Sp(14.5), color: colTextMuted}, x+pad, y+pad+gtx.Dp(unit.Dp(104)))
 	a.drawLabel(gtx, "打开文件后，点击任意段落即可编辑；点击空白处恢复渲染。", textStyle{size: unit.Sp(13), color: colTextFaint}, x+pad, y+pad+gtx.Dp(unit.Dp(132)))
-	a.drawLabel(gtx, "Ctrl+O 打开  ·  Ctrl+S 保存  ·  Ctrl+F 查找", textStyle{size: unit.Sp(12.5), color: colTextFaint}, x+pad, y+pad+gtx.Dp(unit.Dp(154)))
+	a.drawLabel(gtx, "Ctrl+O 打开  ·  Ctrl+S 保存  ·  Ctrl+F 查找  ·  Ctrl+T 目录", textStyle{size: unit.Sp(12.5), color: colTextFaint}, x+pad, y+pad+gtx.Dp(unit.Dp(154)))
 
 	btnW := gtx.Dp(unit.Dp(188))
 	btnH := gtx.Dp(unit.Dp(40))

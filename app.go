@@ -71,6 +71,16 @@ type App struct {
 	findCur       int
 	findFocusWait bool
 
+	tocOpen    bool
+	tocBtn     widget.Clickable
+	tocClose   widget.Clickable
+	tocList    widget.List
+	tocClicks  []widget.Clickable
+	tocEntries []tocEntry
+	tocTops    []int
+	tocCurrent int
+	tocJump    int
+
 	viewportClick  gesture.Click
 	viewportScroll gesture.Scroll
 	globalClick    gesture.Click
@@ -100,6 +110,8 @@ func main() {
 		editIdx:            -1,
 		findCur:            -1,
 		pendingScrollBlock: -1,
+		tocCurrent:         -1,
+		tocJump:            -1,
 		dialogCh:           make(chan dialogResult, 1),
 	}
 	a.configureEditors()
@@ -239,7 +251,15 @@ func (a *App) layoutMain(gtx layout.Context) layout.Dimensions {
 		children = append(children, layout.Rigid(a.layoutFindBar))
 	}
 	children = append(children,
-		layout.Flexed(1, a.layoutViewport),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			if !a.tocOpen {
+				return a.layoutViewport(gtx)
+			}
+			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+				layout.Rigid(a.layoutTOC),
+				layout.Flexed(1, a.layoutViewport),
+			)
+		}),
 		layout.Rigid(a.layoutStatusBar),
 	)
 	dims := layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
@@ -256,6 +276,7 @@ func (a *App) handleShortcuts(gtx layout.Context) {
 		key.Filter{Name: "W", Required: key.ModShortcut},
 		key.Filter{Name: "F", Required: key.ModShortcut},
 		key.Filter{Name: "G", Required: key.ModShortcut},
+		key.Filter{Name: "T", Required: key.ModShortcut},
 		key.Filter{Name: key.NameF3},
 		key.Filter{Name: key.NameEscape},
 		key.Filter{Name: key.NameReturn, Required: key.ModCtrl},
@@ -286,6 +307,8 @@ func (a *App) handleShortcuts(gtx layout.Context) {
 			a.toggleFind()
 		case "G":
 			a.findNext(1)
+		case "T":
+			a.toggleTOC()
 		case key.NameF3:
 			a.findNext(1)
 		case key.NameEscape:
@@ -293,6 +316,9 @@ func (a *App) handleShortcuts(gtx layout.Context) {
 				a.closeFind()
 			} else if a.editIdx >= 0 {
 				a.commitEdit()
+			} else if a.tocOpen {
+				a.tocOpen = false
+				a.invalidate()
 			}
 		case key.NameReturn:
 			if a.editIdx >= 0 {
@@ -355,6 +381,8 @@ func (a *App) openPath(path string) error {
 	a.findCur = -1
 	a.blockRects = a.blockRects[:0]
 	a.images = nil
+	a.tocJump = -1
+	a.rebuildTOC()
 	a.setStatus("已打开 "+filepath.Base(path), 0)
 	a.updateTitle()
 	a.invalidate()
@@ -494,6 +522,12 @@ func (a *App) closeDoc() {
 	a.findCur = -1
 	a.pendingScrollBlock = -1
 	a.images = nil
+	a.tocOpen = false
+	a.tocEntries = nil
+	a.tocClicks = a.tocClicks[:0]
+	a.tocTops = a.tocTops[:0]
+	a.tocCurrent = -1
+	a.tocJump = -1
 	a.setStatus("文件已关闭", 0)
 	a.updateTitle()
 	a.invalidate()
@@ -564,6 +598,7 @@ func (a *App) commitEdit() int {
 		delta = a.doc.splitBlock(idx, raw)
 		a.dirty = true
 		a.refreshFind()
+		a.rebuildTOC()
 		a.updateTitle()
 	}
 	a.editIdx = -1
@@ -602,6 +637,34 @@ func (a *App) closeFind() {
 	a.findFocusWait = false
 	a.pendingScrollBlock = -1
 	a.invalidate()
+}
+
+func (a *App) toggleTOC() {
+	if !a.docOpen || a.doc == nil {
+		return
+	}
+	a.commitEdit()
+	a.rebuildTOC()
+	a.tocOpen = !a.tocOpen
+	a.invalidate()
+}
+
+// rebuildTOC refreshes the outline entries after the document changes. Entry
+// indices stay stable as long as headings keep their relative order, so a
+// pending jump survives an edit commit.
+func (a *App) rebuildTOC() {
+	a.tocEntries = nil
+	if a.doc != nil {
+		a.tocEntries = a.doc.TOC()
+	}
+	for cap(a.tocClicks) < len(a.tocEntries) {
+		a.tocClicks = append(a.tocClicks, widget.Clickable{})
+	}
+	a.tocClicks = a.tocClicks[:len(a.tocEntries)]
+	// Heading positions are only valid for the block layout they were
+	// measured against; the viewport refills them on the next pass.
+	a.tocTops = a.tocTops[:0]
+	a.tocCurrent = -1
 }
 
 func (a *App) updateFind(q string) {

@@ -53,6 +53,33 @@ func TestBlockKinds(t *testing.T) {
 	}
 }
 
+func TestDocumentTOC(t *testing.T) {
+	src := "# 标题 **一**\n\npara\n\n## 小节\n\n###  \n\n#### Deep *name*\n\nsetext\n======\n\nno heading\n\n### Another\n"
+	doc := parseDocument(src)
+	toc := doc.TOC()
+	want := []tocEntry{
+		{Level: 1, Title: "标题 一"},
+		{Level: 2, Title: "小节"},
+		{Level: 4, Title: "Deep name"},
+		{Level: 1, Title: "setext"},
+		{Level: 3, Title: "Another"},
+	}
+	if len(toc) != len(want) {
+		t.Fatalf("got %d entries: %+v", len(toc), toc)
+	}
+	for i, e := range want {
+		if toc[i].Level != e.Level || toc[i].Title != e.Title {
+			t.Fatalf("entry %d = (%d, %q) want (%d, %q)", i, toc[i].Level, toc[i].Title, e.Level, e.Title)
+		}
+		if toc[i].Block < 0 || toc[i].Block >= len(doc.Blocks) {
+			t.Fatalf("entry %d block index out of range: %d", i, toc[i].Block)
+		}
+		if doc.Blocks[toc[i].Block].Kind != kindHeading {
+			t.Fatalf("entry %d points to a non-heading block", i)
+		}
+	}
+}
+
 func TestInlinePlain(t *testing.T) {
 	doc := parseDocument("a **bold** and `code` and [link](x)\n")
 	got := doc.Blocks[0].Display.Plain
