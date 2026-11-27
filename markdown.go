@@ -736,6 +736,29 @@ func (d *Document) splitBlock(idx int, raw string) int {
 	return n - 1
 }
 
+// removeBlock deletes a block. The gap that separated it from the next block
+// becomes the separator to the previous one, so neighbouring blocks keep their
+// blank line and cannot accidentally merge into a different construct (for
+// example a paragraph followed by "---" turning into a setext heading). It is
+// used when an edit empties a block: the block disappears instead of lingering
+// as an empty paragraph.
+func (d *Document) removeBlock(idx int) {
+	if idx < 0 || idx >= len(d.Blocks) || len(d.Blocks) <= 1 {
+		return
+	}
+	if idx+1 < len(d.Gaps) {
+		if idx == 0 {
+			// Nothing precedes the first block any more: start the file at
+			// the block that follows it.
+			d.Gaps = append([]string{""}, d.Gaps[2:]...)
+		} else {
+			d.Gaps[idx] = d.Gaps[idx+1]
+			d.Gaps = append(d.Gaps[:idx+1], d.Gaps[idx+2:]...)
+		}
+	}
+	d.Blocks = append(d.Blocks[:idx], d.Blocks[idx+1:]...)
+}
+
 func (d *Document) Source() string {
 	var sb strings.Builder
 	for i, b := range d.Blocks {

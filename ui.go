@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"strings"
 
 	"gioui.org/gesture"
 	"gioui.org/io/key"
@@ -213,7 +214,7 @@ func (a *App) layoutFindBar(gtx layout.Context) layout.Dimensions {
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions { return a.spacer(gtx, unit.Dp(6)) }),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return a.textButton(gtx, "✕", &a.findClose, true, false, a.closeFind)
+				return a.textButton(gtx, "×", &a.findClose, true, false, a.closeFind)
 			}),
 		)
 	})
@@ -279,7 +280,7 @@ func (a *App) layoutStatusBar(gtx layout.Context) layout.Dimensions {
 	}
 	words := 0
 	if a.doc != nil {
-		words = a.doc.WordCount()
+		words = a.wordCountValue()
 	}
 	right := ""
 	if a.docOpen {
@@ -324,10 +325,38 @@ func (a *App) layoutTOC(gtx layout.Context) layout.Dimensions {
 		}
 	}
 
+	// Follow the document: when the highlighted heading changes, scroll the
+	// outline so that heading is visible. The list is only moved when the
+	// active entry left the visible range, so manually browsing the outline
+	// is not fought over.
+	headerH := gtx.Dp(unit.Dp(46))
+	listH := gtx.Constraints.Max.Y - headerH
+	entryH := gtx.Dp(unit.Dp(30))
+	if a.tocCurrent != a.tocShown {
+		a.tocShown = a.tocCurrent
+		if a.tocCurrent >= 0 && entryH > 0 && listH > 0 {
+			visible := listH / entryH
+			if visible < 1 {
+				visible = 1
+			}
+			first := a.tocList.Position.First
+			if a.tocCurrent < first || a.tocCurrent >= first+visible {
+				target := a.tocCurrent - visible/2
+				if maxFirst := len(a.tocEntries) - visible; target > maxFirst {
+					target = maxFirst
+				}
+				if target < 0 {
+					target = 0
+				}
+				a.tocList.Position.First = target
+				a.tocList.Position.Offset = 0
+			}
+		}
+	}
+
 	fillRect(gtx.Ops, image.Rect(0, 0, w, gtx.Constraints.Max.Y), colSurface)
 	fillRect(gtx.Ops, image.Rect(w-1, 0, w, gtx.Constraints.Max.Y), colBorderSoft)
 
-	headerH := gtx.Dp(unit.Dp(46))
 	fillRect(gtx.Ops, image.Rect(0, 0, w, headerH), colSurfaceAlt)
 	fillRect(gtx.Ops, image.Rect(0, headerH-1, w, headerH), colBorderSoft)
 
@@ -348,7 +377,7 @@ func (a *App) layoutTOC(gtx layout.Context) layout.Dimensions {
 	bc := gtx
 	bc.Constraints.Min = image.Pt(btnW, btnH)
 	bc.Constraints.Max = image.Pt(btnW, btnH)
-	_ = a.textButton(bc, "✕", &a.tocClose, true, false, func() {
+	_ = a.textButton(bc, "×", &a.tocClose, true, false, func() {
 		a.tocOpen = false
 		a.invalidate()
 	})
@@ -459,11 +488,63 @@ func (a *App) layoutViewport(gtx layout.Context) layout.Dimensions {
 			contentW = size.X - gtx.Dp(unit.Dp(24))
 		}
 		x := (size.X - contentW) / 2
+
+		// Pass 1: position every block from its measured height, or from an
+		// estimate while it has never been on screen. Pass 2 then lays out
+		// only the blocks near the viewport, so a frame costs what is visible
+		// rather than what the file contains.
+		if a.syncBlockHeights(contentW) {
+			a.anchorPending = true
+		}
+		a.blockTops = a.blockTops[:0]
 		y := topPad
+		for i := range a.doc.Blocks {
+			h := a.blockHeights[i]
+			if h <= 0 {
+				h = a.estimateBlockHeight(gtx, a.doc.Blocks[i], contentW)
+				a.blockHeights[i] = h
+			}
+			a.blockTops = append(a.blockTops, y)
+			y += h + gap
+		}
+		a.contentH = y - gap + bottomPad
+
+		// Keep the reading position when the content width changes (outline
+		// toggled, window resized): the block at the top stays where it was.
+		if a.anchorPending {
+			a.anchorPending = false
+			if a.scroll > 0 && len(a.blockTops) > 0 {
+				blk := clamp(a.anchorBlock, 0, len(a.blockTops)-1)
+				a.scroll = a.blockTops[blk] + a.anchorOffset
+			}
+		}
+		maxScrollNow := 0
+		if a.contentH > size.Y {
+			maxScrollNow = a.contentH - size.Y
+		}
+		a.scroll = clamp(a.scroll, 0, maxScrollNow)
+
+		overscan := size.Y
+		viewTop := a.scroll - overscan
+		viewBottom := a.scroll + size.Y + overscan
+		forceIdx := -1
+		if a.tocJump >= 0 && a.tocJump < len(a.tocEntries) {
+			forceIdx = a.tocEntries[a.tocJump].Block
+		}
+		if a.pendingScrollBlock >= 0 {
+			forceIdx = a.pendingScrollBlock
+		}
 		a.blockRects = a.blockRects[:0]
 		a.editRect = image.Rectangle{}
+		scrollAdjust := 0
 		for i := range a.doc.Blocks {
-			screenTop := y - a.scroll
+			top := a.blockTops[i]
+			h := a.blockHeights[i]
+			screenTop := top - a.scroll
+			if a.editIdx != i && i != forceIdx && (top+h < viewTop || top > viewBottom) {
+				a.blockRects = append(a.blockRects, image.Rect(x, screenTop, x+contentW, screenTop+h))
+				continue
+			}
 			offset := op.Offset(image.Pt(x, screenTop)).Push(gtx.Ops)
 			var dims layout.Dimensions
 			if a.editIdx == i {
@@ -473,10 +554,36 @@ func (a *App) layoutViewport(gtx layout.Context) layout.Dimensions {
 				dims = a.layoutBlock(gtx, i, contentW)
 			}
 			offset.Pop()
+			if dims.Size.Y > 0 {
+				if top+h <= a.scroll && dims.Size.Y != h {
+					// A block above the viewport was taller or shorter than
+					// estimated; compensate so the visible text does not jump.
+					scrollAdjust += dims.Size.Y - h
+				}
+				a.blockHeights[i] = dims.Size.Y
+			}
 			a.blockRects = append(a.blockRects, image.Rect(x, screenTop, x+contentW, screenTop+dims.Size.Y))
-			y += dims.Size.Y + gap
 		}
-		a.contentH = y + bottomPad
+
+		// Remember the block at the top of the viewport so a later width
+		// change can restore the same reading position.
+		if len(a.blockTops) > 0 {
+			blk := 0
+			for i := len(a.blockTops) - 1; i >= 0; i-- {
+				if a.blockTops[i] <= a.scroll {
+					blk = i
+					break
+				}
+			}
+			a.anchorBlock = blk
+			a.anchorOffset = a.scroll - a.blockTops[blk]
+		}
+
+		if scrollAdjust != 0 {
+			a.scroll = clamp(a.scroll+scrollAdjust, 0, maxScrollNow)
+			a.anchorPending = true
+			gtx.Execute(op.InvalidateCmd{})
+		}
 
 		// Record heading tops in content space. The outline panel reads these
 		// when it draws, so its highlight follows scrolling without waiting
@@ -674,4 +781,81 @@ func (a *App) layoutModal(gtx layout.Context) {
 			a.closeModal()
 		}
 	})
+}
+
+// estimateBlockHeight approximates a block's height without shaping its text.
+// Blocks outside the viewport are positioned with this estimate until they
+// scroll into view and get measured for real, which keeps the scrollbar and
+// the scroll range close to the truth without paying for a full layout.
+func (a *App) estimateBlockHeight(gtx layout.Context, b *Block, width int) int {
+	if b == nil {
+		return gtx.Dp(unit.Dp(30))
+	}
+	display := b.Display
+	if display == nil {
+		return gtx.Dp(unit.Dp(30))
+	}
+
+	switch b.Kind {
+	case kindRule:
+		return gtx.Dp(unit.Dp(28))
+	case kindCode:
+		lines := 1 + strings.Count(display.Code, "\n")
+		h := gtx.Dp(unit.Dp(16+28)) + lines*gtx.Sp(unit.Sp(21))
+		if strings.TrimSpace(display.CodeLang) != "" {
+			h += gtx.Sp(unit.Sp(19))
+		}
+		return h
+	case kindTable:
+		rows := 1
+		if display.Table != nil {
+			rows += len(display.Table.Rows)
+		}
+		return rows*gtx.Sp(unit.Sp(34)) + gtx.Dp(unit.Dp(16))
+	}
+
+	size := unit.Sp(16)
+	lineSp := unit.Sp(28)
+	padTop := 12
+	padBottom := 12
+	avail := width
+	switch b.Kind {
+	case kindHeading:
+		level := clamp(b.Level, 1, 6)
+		size = headingSize(level)
+		lineSp = unit.Sp(float32(size) * 1.75)
+		padTop = 20
+		padBottom = 9
+		if level <= 2 {
+			padBottom += 4
+		}
+	case kindQuote:
+		size = unit.Sp(15.5)
+		lineSp = unit.Sp(26)
+		padTop = 10
+		padBottom = 10
+		avail = width - gtx.Dp(unit.Dp(18))
+	case kindList:
+		lineSp = unit.Sp(27)
+		padTop = 9
+		padBottom = 9
+		avail = width - gtx.Dp(unit.Dp(34))
+	}
+	if avail < 80 {
+		avail = 80
+	}
+
+	textW := 0
+	for _, r := range display.Plain {
+		if isCJK(r) {
+			textW += gtx.Sp(size)
+		} else {
+			textW += gtx.Sp(unit.Sp(float32(size) * 0.52))
+		}
+	}
+	lines := 1
+	if textW > avail {
+		lines = (textW + avail - 1) / avail
+	}
+	return lines*gtx.Sp(lineSp) + gtx.Dp(unit.Dp(float32(padTop+padBottom)))
 }

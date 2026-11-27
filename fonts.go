@@ -35,9 +35,6 @@ func loadFonts() (*fontSet, error) {
 			candidate{win + `\Fonts\msyhbd.ttc`, false},
 			candidate{win + `\Fonts\consola.ttf`, true},
 			candidate{win + `\Fonts\consolab.ttf`, true},
-			candidate{win + `\Fonts\segoeui.ttf`, false},
-			candidate{win + `\Fonts\segoeuib.ttf`, false},
-			candidate{win + `\Fonts\simhei.ttf`, false},
 		)
 	} else {
 		// The WSL paths make development pleasant on machines that have a
@@ -81,6 +78,33 @@ func loadFonts() (*fontSet, error) {
 			}
 		}
 	}
+	// A .ttc usually carries a near-identical "UI" variant next to the family
+	// that is actually referenced. Parsing both doubles the font tables kept
+	// in memory, so the unused duplicates are dropped here.
+	if len(faces) > 1 {
+		kept := faces[:0]
+		for _, ff := range faces {
+			if strings.Contains(string(ff.Font.Typeface), " UI") {
+				continue
+			}
+			kept = append(kept, ff)
+		}
+		if len(kept) > 0 {
+			faces = kept
+		}
+		if bodyFamily != "" {
+			found := false
+			for _, ff := range faces {
+				if string(ff.Font.Typeface) == bodyFamily {
+					found = true
+					break
+				}
+			}
+			if !found && len(faces) > 0 {
+				bodyFamily = string(faces[0].Font.Typeface)
+			}
+		}
+	}
 
 	if len(faces) == 0 {
 		faces = gofont.Regular()
@@ -102,10 +126,10 @@ func loadFonts() (*fontSet, error) {
 	// Latin and CJK, Consolas covers Latin code, and the fallback covers CJK
 	// inside code blocks.
 	body := font.Font{
-		Typeface: font.Typeface(bodyFamily + ", Microsoft YaHei, Microsoft YaHei UI, DejaVu Sans, Go"),
+		Typeface: font.Typeface(bodyFamily + ", Microsoft YaHei, DejaVu Sans, Go"),
 	}
 	mono := font.Font{
-		Typeface: font.Typeface(monoFamily + ", Microsoft YaHei, Microsoft YaHei UI, Consolas, DejaVu Sans Mono, Go"),
+		Typeface: font.Typeface(monoFamily + ", Microsoft YaHei, Consolas, DejaVu Sans Mono, Go"),
 	}
 	shaper := text.NewShaper(text.NoSystemFonts(), text.WithCollection(faces))
 	if shaper == nil {

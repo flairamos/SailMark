@@ -292,10 +292,15 @@ func (a *App) layoutParagraph(gtx layout.Context, b *Block, width int, matches [
 
 	if !hasText && !hasImages {
 		if b.Raw == "" {
-			st.color = colTextFaint
+			// A brand new document shows a hint. An emptied block inside a
+			// real document is deleted when the edit is committed; if one
+			// still exists it only reserves a blank, clickable line.
 			h := top + bottom + gtx.Sp(unit.Sp(16))*2
-			y := top + gtx.Sp(unit.Sp(16))/2
-			a.drawLabel(gtx, "点击此处开始编写…", st, 2, y)
+			if a.doc != nil && len(a.doc.Blocks) == 1 {
+				st.color = colTextFaint
+				y := top + gtx.Sp(unit.Sp(16))/2
+				a.drawLabel(gtx, "点击此处开始编写…", st, 2, y)
+			}
 			return layout.Dimensions{Size: image.Pt(width, h)}
 		}
 		// Whitespace-only block: keep a single empty line clickable.

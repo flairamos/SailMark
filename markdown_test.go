@@ -35,6 +35,30 @@ func TestDocumentRoundTrip(t *testing.T) {
 	}
 }
 
+// Emptying a block removes it and keeps a single separating gap, so saving
+// does not accumulate blank lines where the paragraph used to be.
+func TestRemoveBlock(t *testing.T) {
+	src := "a\n\nb\n\nc\n"
+	doc := parseDocument(src)
+	if len(doc.Blocks) != 3 {
+		t.Fatalf("blocks = %d", len(doc.Blocks))
+	}
+	doc.removeBlock(1)
+	if got, want := doc.Source(), "a\n\nc\n"; got != want {
+		t.Fatalf("remove middle: got %q want %q", got, want)
+	}
+	doc.removeBlock(0)
+	if got, want := doc.Source(), "c\n"; got != want {
+		t.Fatalf("remove first: got %q want %q", got, want)
+	}
+	// The last remaining block is never removed; an empty document still needs
+	// something to click and type into.
+	doc.removeBlock(0)
+	if len(doc.Blocks) != 1 {
+		t.Fatalf("last block removed, blocks = %d", len(doc.Blocks))
+	}
+}
+
 func TestBlockKinds(t *testing.T) {
 	src := "# H1\n\npara\nline2\n\n- item\n- [x] task\n\n> quote\n\n```go\ncode\n```\n\n---\n\n| a | b |\n| --- | --- |\n| 1 | 2 |"
 	doc := parseDocument(src)

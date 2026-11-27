@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 	"unicode"
@@ -79,6 +80,7 @@ type App struct {
 	tocEntries []tocEntry
 	tocTops    []int
 	tocCurrent int
+	tocShown   int
 	tocJump    int
 
 	viewportClick  gesture.Click
@@ -103,9 +105,31 @@ type App struct {
 	status         string
 	statusColorKey int
 	lastStatus     time.Time
+
+	// Heights are cached per block so off-screen blocks can be positioned
+	// without laying them out. A zero entry means "not measured yet" and is
+	// filled in with an estimate.
+	blockHeights []int
+	blockTops    []int
+	heightsWidth int
+	heightsDoc   *Document
+
+	// anchorBlock/anchorOffset remember where the reader is, so toggling the
+	// outline or resizing the window does not move the text under them.
+	anchorBlock   int
+	anchorOffset  int
+	anchorPending bool
+
+	wordCount      int
+	wordCountValid bool
 }
 
 func main() {
+	// A long Markdown file used to let the Go heap grow to a gigabyte or more
+	// because every block was laid out on every frame. The viewport now only
+	// lays out what is visible, and this soft limit keeps the garbage collector
+	// from ever letting the process balloon again.
+	debug.SetMemoryLimit(baseMemLimit)
 	a := &App{
 		editIdx:            -1,
 		findCur:            -1,
@@ -123,6 +147,21 @@ func main() {
 	}
 	go a.run()
 	app.Main()
+}
+
+// baseMemLimit is the soft heap budget for a small document. Opening a large
+// file raises it so the collector never fights a live set it cannot shrink.
+const baseMemLimit = 128 << 20
+
+// memoryLimitFor scales the heap budget with the source size: roughly one
+// hundred bytes of retained layout data per source byte, with the base budget
+// as the floor.
+func memoryLimitFor(sourceLen int) int64 {
+	limit := int64(baseMemLimit)
+	if extra := int64(sourceLen) * 96; extra > limit {
+		limit = extra
+	}
+	return limit
 }
 
 func (a *App) run() {
@@ -365,6 +404,9 @@ func (a *App) openPath(path string) error {
 	}
 	text := strings.TrimPrefix(string(data), "\ufeff")
 	a.doc = parseDocument(text)
+	debug.SetMemoryLimit(memoryLimitFor(len(data)))
+	a.resetLayoutCache()
+	a.invalidateWordCount()
 	a.path = path
 	a.docOpen = true
 	a.dirty = false
@@ -386,6 +428,9 @@ func (a *App) openPath(path string) error {
 	a.setStatus("已打开 "+filepath.Base(path), 0)
 	a.updateTitle()
 	a.invalidate()
+	// Parsing and the first layout leave transient buffers behind; hand the
+	// freed pages back to the OS instead of keeping a large working set.
+	go debug.FreeOSMemory()
 	return nil
 }
 
@@ -507,6 +552,9 @@ func (a *App) requestClose() {
 
 func (a *App) closeDoc() {
 	a.doc = nil
+	debug.SetMemoryLimit(baseMemLimit)
+	a.resetLayoutCache()
+	a.invalidateWordCount()
 	a.path = ""
 	a.docOpen = false
 	a.dirty = false
@@ -531,6 +579,7 @@ func (a *App) closeDoc() {
 	a.setStatus("文件已关闭", 0)
 	a.updateTitle()
 	a.invalidate()
+	go debug.FreeOSMemory()
 }
 
 func (a *App) closeModal() {
@@ -542,6 +591,62 @@ func (a *App) invalidate() {
 	if a.w != nil {
 		a.w.Invalidate()
 	}
+}
+
+// invalidateHeights drops every cached block height after the content changed.
+// The reading anchor survives, so the next frame can put the same block back
+// under the reader instead of jumping when the estimates kick in again.
+func (a *App) invalidateHeights() {
+	a.blockHeights = a.blockHeights[:0]
+	a.blockTops = a.blockTops[:0]
+	a.heightsWidth = 0
+	a.heightsDoc = nil
+	a.anchorPending = true
+}
+
+// resetLayoutCache drops the height cache and the reading anchor. It is used
+// when a different document is opened or the current one is closed.
+func (a *App) resetLayoutCache() {
+	a.blockHeights = a.blockHeights[:0]
+	a.blockTops = a.blockTops[:0]
+	a.heightsWidth = 0
+	a.heightsDoc = nil
+	a.anchorBlock = 0
+	a.anchorOffset = 0
+	a.anchorPending = false
+}
+
+// syncBlockHeights makes sure there is exactly one height slot per block for
+// the current content width. It reports whether the cache was rebuilt.
+func (a *App) syncBlockHeights(width int) bool {
+	if a.doc == nil {
+		a.blockHeights = a.blockHeights[:0]
+		return false
+	}
+	if a.heightsDoc != a.doc || a.heightsWidth != width || len(a.blockHeights) != len(a.doc.Blocks) {
+		a.heightsDoc = a.doc
+		a.heightsWidth = width
+		a.blockHeights = make([]int, len(a.doc.Blocks))
+		return true
+	}
+	return false
+}
+
+func (a *App) invalidateWordCount() {
+	a.wordCountValid = false
+}
+
+// wordCountValue computes the document statistics at most once per change;
+// the status bar asks for them on every frame.
+func (a *App) wordCountValue() int {
+	if !a.wordCountValid {
+		a.wordCount = 0
+		if a.doc != nil {
+			a.wordCount = a.doc.WordCount()
+		}
+		a.wordCountValid = true
+	}
+	return a.wordCount
 }
 
 func (a *App) beginEditAt(idx, relX, relY, width, height int) {
@@ -595,8 +700,22 @@ func (a *App) commitEdit() int {
 	b := a.doc.Blocks[idx]
 	delta := 0
 	if raw != b.Raw {
-		delta = a.doc.splitBlock(idx, raw)
 		a.dirty = true
+		if strings.TrimSpace(raw) == "" && len(a.doc.Blocks) > 1 {
+			// Emptying a block deletes it, so no "click here to write"
+			// placeholder is left behind in the rendered document.
+			a.doc.removeBlock(idx)
+			delta = -1
+		} else {
+			delta = a.doc.splitBlock(idx, raw)
+		}
+		// Keep the reading anchor pointing at the same content when blocks
+		// were inserted or removed above it.
+		if delta != 0 && idx <= a.anchorBlock {
+			a.anchorBlock = clamp(a.anchorBlock+delta, 0, len(a.doc.Blocks)-1)
+		}
+		a.invalidateHeights()
+		a.invalidateWordCount()
 		a.refreshFind()
 		a.rebuildTOC()
 		a.updateTitle()
@@ -646,6 +765,7 @@ func (a *App) toggleTOC() {
 	a.commitEdit()
 	a.rebuildTOC()
 	a.tocOpen = !a.tocOpen
+	a.tocShown = -2 // force the outline to reveal the current heading
 	a.invalidate()
 }
 
@@ -665,6 +785,7 @@ func (a *App) rebuildTOC() {
 	// measured against; the viewport refills them on the next pass.
 	a.tocTops = a.tocTops[:0]
 	a.tocCurrent = -1
+	a.tocShown = -2
 }
 
 func (a *App) updateFind(q string) {
